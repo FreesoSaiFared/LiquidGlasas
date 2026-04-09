@@ -1,5 +1,5 @@
 {
   "name": "Cosmic Gel Lab",
   "description": "A 3D interactive simulation of the universe as a viscoelastic medium, featuring longitudinal waves and transverse shear vortices.",
-  "requestFramePermissions": []
+  "requestFramePermissions": ["xr-spatial-tracking"]
 }
