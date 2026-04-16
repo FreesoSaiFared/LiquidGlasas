@@ -1078,7 +1078,7 @@ const Scene = ({ viewMode, setViewMode, settings, setSettings, mathSettings, set
       ))}
 
       {/* Post-processing for Dazzling Visuals - Optimized for VR */}
-      <EffectComposer>
+      <EffectComposer enableNormalPass={settings.enableAdvancedRendering}>
         {settings.enableAdvancedRendering && (
           <>
             <SSAO samples={21} radius={0.1} intensity={20} luminanceInfluence={0.1} />
