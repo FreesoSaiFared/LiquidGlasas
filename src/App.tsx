@@ -2,7 +2,7 @@ import React, { useRef, useMemo, useState, useCallback, useEffect } from 'react'
 import { Canvas, useFrame, ThreeEvent, useThree, extend, ThreeElement } from '@react-three/fiber'
 import { OrbitControls, Stars, PerspectiveCamera, shaderMaterial, Text, Html, Detailed } from '@react-three/drei'
 import { XR, createXRStore, useXR, useXRInputSourceStates } from '@react-three/xr'
-import { EffectComposer, Bloom, ChromaticAberration } from '@react-three/postprocessing'
+import { EffectComposer, Bloom, ChromaticAberration, Vignette, Noise, SSAO } from '@react-three/postprocessing'
 import { BlendFunction } from 'postprocessing'
 import * as THREE from 'three'
 import { motion, AnimatePresence } from 'motion/react'
@@ -211,6 +211,74 @@ const store = createXRStore({
 })
 
 // --- 1.6. Sound Synthesis Utility ---
+// Create a persistent audio context and global nodes for ambient sound
+let audioCtx: AudioContext | null = null;
+let ambientOsc: OscillatorNode | null = null;
+let ambientGain: GainNode | null = null;
+let modulationOsc: OscillatorNode | null = null;
+let modulationGain: GainNode | null = null;
+
+const initAmbientAudio = () => {
+  if (audioCtx || !window.AudioContext) return;
+  try {
+    audioCtx = new AudioContext();
+    
+    // Carrier oscillator (low hum)
+    ambientOsc = audioCtx.createOscillator();
+    ambientOsc.type = 'sine';
+    ambientOsc.frequency.value = 55; // Low A
+    
+    // Modulation oscillator for pulsing effect
+    modulationOsc = audioCtx.createOscillator();
+    modulationOsc.type = 'sine';
+    modulationOsc.frequency.value = 0.5; // 0.5 Hz pulse
+    
+    modulationGain = audioCtx.createGain();
+    modulationGain.gain.value = 10; // Modulation depth
+    
+    ambientGain = audioCtx.createGain();
+    ambientGain.gain.value = 0; // Start muted
+    
+    // Connect AM synthesis
+    modulationOsc.connect(modulationGain);
+    modulationGain.connect(ambientOsc.frequency); // Modulate frequency slightly
+    
+    ambientOsc.connect(ambientGain);
+    ambientGain.connect(audioCtx.destination);
+    
+    ambientOsc.start();
+    modulationOsc.start();
+  } catch (e) {
+    console.warn("Ambient audio initialization failed", e);
+  }
+}
+
+const updateAmbientAudio = (viewMode: string, waveSpeed: number, volume: number) => {
+  if (!audioCtx || !ambientOsc || !ambientGain || !modulationOsc) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  
+  const now = audioCtx.currentTime;
+  
+  // Base target volume based on settings
+  const targetGain = volume * 0.15;
+  ambientGain.gain.setTargetAtTime(targetGain, now, 1.0);
+  
+  // React to viewMode
+  if (viewMode === 'fluid') {
+    ambientOsc.frequency.setTargetAtTime(55, now, 0.5); // Deep drone
+    ambientOsc.type = 'sine';
+    modulationOsc.frequency.setTargetAtTime(0.2, now, 0.5);
+  } else if (viewMode === 'math') {
+    ambientOsc.frequency.setTargetAtTime(110, now, 0.5); // Higher, cleaner tone
+    ambientOsc.type = 'triangle';
+    modulationOsc.frequency.setTargetAtTime(4.0, now, 0.5); // Faster flutter
+  } else if (viewMode === 'hybrid') {
+    ambientOsc.frequency.setTargetAtTime(82.41, now, 0.5); // E2
+    ambientOsc.type = 'sawtooth';
+    modulationOsc.frequency.setTargetAtTime(waveSpeed * 0.2, now, 0.5); // Reacts to speed
+  }
+}
+
 const playSound = (type: 'punch' | 'beam' | 'ui', volume: number = 0.5) => {
   try {
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
@@ -635,15 +703,240 @@ const PunchIndicator = ({ punchData, settings }: {
   );
 }
 
+// --- 3.8. Waveform Analyzer Overlay ---
+const WaveformAnalyzer = ({ mathSettings, punchData }: { mathSettings: any, punchData: any }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  
+  // Setup a compiled version of the X equation to sample it purely for 2D visualization
+  const compiledX = useMemo(() => { try { return compile(mathSettings.eqX) } catch(e) { return null } }, [mathSettings.eqX]);
+  const scope = useMemo(() => ({ z: 0, t: 0, A: 0, k: mathSettings.k, w: mathSettings.w, phi: mathSettings.phi }), [mathSettings.k, mathSettings.w, mathSettings.phi]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let animationId: number;
+    let t = 0;
+
+    const draw = () => {
+      t += 0.016; // Approx delta time for 60fps presentation
+      
+      // Update scope
+      scope.t = t;
+      scope.k = mathSettings.k;
+      scope.w = mathSettings.w;
+      scope.phi = mathSettings.phi;
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      
+      // Draw Grid
+      ctx.strokeStyle = 'rgba(0, 255, 255, 0.1)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, canvas.height / 2);
+      ctx.lineTo(canvas.width, canvas.height / 2);
+      ctx.stroke();
+
+      if (!compiledX) {
+        animationId = requestAnimationFrame(draw);
+        return;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(0, canvas.height / 2);
+      ctx.strokeStyle = '#00ffff';
+      ctx.lineWidth = 2;
+
+      // Sample the equation across the canvas width
+      for (let i = 0; i < canvas.width; i++) {
+        // Map pixel x to virtual 'z' space
+        const z = (i / canvas.width) * 20 - 10;
+        scope.z = z;
+        
+        let amplitude = mathSettings.baseA;
+        
+        // Add punch disturbance to the 2D analyzer too
+        if (punchData) {
+          const tPunch = t - (punchData.time || 0); // Simplified relative time check
+           if (tPunch > 0 && tPunch < 5) {
+             amplitude += Math.exp(-tPunch) * 2;
+           }
+        }
+        
+        scope.A = amplitude;
+
+        try {
+          const val = compiledX.evaluate(scope);
+          // Scale value to canvas height
+          const y = canvas.height / 2 - (val * (canvas.height / 4));
+          ctx.lineTo(i, y);
+        } catch (e) {
+          // Skip drawing this point if evaluation fails
+        }
+      }
+      ctx.stroke();
+      
+      // Draw glow
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = '#00ffff';
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      animationId = requestAnimationFrame(draw);
+    };
+
+    draw();
+
+    return () => cancelAnimationFrame(animationId);
+  }, [mathSettings, compiledX, punchData, scope]);
+
+  return (
+    <div className="absolute bottom-4 right-[350px] w-64 h-24 bg-black/50 backdrop-blur-md border border-cyan-500/30 rounded-lg p-2 overflow-hidden z-[90] pointer-events-none hidden md:block group">
+      <div className="text-[8px] text-cyan-500 uppercase tracking-widest mb-1 opacity-50">Local Waveform Sample</div>
+      <canvas ref={canvasRef} width={240} height={70} className="w-full h-[70px]" />
+      
+      {/* Tooltip for Analyzer */}
+      <div className="absolute inset-0 bg-black/80 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+         <span className="text-[10px] text-cyan-300 px-4 text-center">Real-time projection of X-axis equation x(z,t)</span>
+      </div>
+    </div>
+  );
+}
+
 // --- 4. The Scene Controller ---
-const Scene = ({ viewMode, setViewMode, settings, mathSettings }: { 
+const VRControlPanel = ({ settings, setSettings, setViewMode }: { settings: any, setSettings: any, setViewMode: any }) => {
+  const session = useXR((state) => state.session)
+  if (!session) return null;
+
+  return (
+    <group position={[0, 1.5, -2]}>
+      {/* Background Panel */}
+      <mesh position={[0, 0, -0.05]}>
+        <boxGeometry args={[2.5, 1.5, 0.05]} />
+        <meshBasicMaterial color="#001122" transparent opacity={0.8} />
+      </mesh>
+      
+      <Text position={[0, 0.6, 0]} fontSize={0.12} color="#00ffff" anchorX="center">VR Control Station</Text>
+      
+      {/* Wave Speed Control */}
+      <Text position={[-0.8, 0.3, 0]} fontSize={0.08} color="white" anchorX="left">Wave Speed: {settings.waveSpeed.toFixed(1)}</Text>
+      <mesh position={[0.4, 0.3, 0]} onClick={() => setSettings({...settings, waveSpeed: Math.max(1, settings.waveSpeed - 2)})}>
+         <boxGeometry args={[0.2, 0.2, 0.05]} /><meshBasicMaterial color="#ff0055" />
+      </mesh>
+      <Text position={[0.4, 0.3, 0.03]} fontSize={0.1} color="white" anchorX="center" pointerEvents="none">-</Text>
+      
+      <mesh position={[0.8, 0.3, 0]} onClick={() => setSettings({...settings, waveSpeed: Math.min(30, settings.waveSpeed + 2)})}>
+         <boxGeometry args={[0.2, 0.2, 0.05]} /><meshBasicMaterial color="#00ff55" />
+      </mesh>
+      <Text position={[0.8, 0.3, 0.03]} fontSize={0.1} color="white" anchorX="center" pointerEvents="none">+</Text>
+
+      {/* Intensity Control */}
+      <Text position={[-0.8, 0.0, 0]} fontSize={0.08} color="white" anchorX="left">Intensity: {settings.intensityFalloff.toFixed(2)}</Text>
+      <mesh position={[0.4, 0.0, 0]} onClick={() => setSettings({...settings, intensityFalloff: Math.max(0.01, settings.intensityFalloff - 0.05)})}>
+         <boxGeometry args={[0.2, 0.2, 0.05]} /><meshBasicMaterial color="#ff0055" />
+      </mesh>
+      <Text position={[0.4, 0.0, 0.03]} fontSize={0.1} color="white" anchorX="center" pointerEvents="none">-</Text>
+      
+      <mesh position={[0.8, 0.0, 0]} onClick={() => setSettings({...settings, intensityFalloff: Math.min(1.0, settings.intensityFalloff + 0.05)})}>
+         <boxGeometry args={[0.2, 0.2, 0.05]} /><meshBasicMaterial color="#00ff55" />
+      </mesh>
+      <Text position={[0.8, 0.0, 0.03]} fontSize={0.1} color="white" anchorX="center" pointerEvents="none">+</Text>
+
+      {/* Auto Evolve Toggle */}
+      <Text position={[-0.8, -0.3, 0]} fontSize={0.08} color="white" anchorX="left">Auto Evolve Wave</Text>
+      <mesh position={[0.6, -0.3, 0]} onClick={() => setSettings({...settings, autoEvolve: !settings.autoEvolve})}>
+         <boxGeometry args={[0.6, 0.2, 0.05]} /><meshBasicMaterial color={settings.autoEvolve ? "#00ff55" : "#333333"} />
+      </mesh>
+      <Text position={[0.6, -0.3, 0.03]} fontSize={0.08} color="white" anchorX="center" pointerEvents="none">{settings.autoEvolve ? 'ON' : 'OFF'}</Text>
+      
+      {/* Visual Modes */}
+      <Text position={[-0.8, -0.6, 0]} fontSize={0.08} color="white" anchorX="left">View Mode</Text>
+      <mesh position={[0.0, -0.6, 0]} onClick={() => setViewMode('fluid')}>
+         <boxGeometry args={[0.3, 0.15, 0.05]} /><meshBasicMaterial color="#00ffff" />
+      </mesh>
+      <Text position={[0.0, -0.6, 0.03]} fontSize={0.06} color="black" anchorX="center" pointerEvents="none">F</Text>
+      <mesh position={[0.4, -0.6, 0]} onClick={() => setViewMode('math')}>
+         <boxGeometry args={[0.3, 0.15, 0.05]} /><meshBasicMaterial color="#ff00ff" />
+      </mesh>
+      <Text position={[0.4, -0.6, 0.03]} fontSize={0.06} color="black" anchorX="center" pointerEvents="none">M</Text>
+      <mesh position={[0.8, -0.6, 0]} onClick={() => setViewMode('hybrid')}>
+         <boxGeometry args={[0.3, 0.15, 0.05]} /><meshBasicMaterial color="#ffff00" />
+      </mesh>
+      <Text position={[0.8, -0.6, 0.03]} fontSize={0.06} color="black" anchorX="center" pointerEvents="none">H</Text>
+    </group>
+  );
+}
+
+const Volumetric3DWaveform = ({ settings, mathSettings }: { settings: any, mathSettings: any }) => {
+  const meshRef = useRef<THREE.InstancedMesh>(null!);
+  const count = 30; // 30x30 grid = 900 instances
+  
+  const compiledX = useMemo(() => { try { return compile(mathSettings.eqX) } catch { return null } }, [mathSettings.eqX]);
+  const scope = useMemo(() => ({ z:0, t:0, A:0, k: mathSettings.k, w: mathSettings.w, phi: mathSettings.phi }), [mathSettings.k, mathSettings.w, mathSettings.phi]);
+  const dummy = useMemo(() => new THREE.Object3D(), []);
+
+  useFrame(({ clock }) => {
+    if (!settings.show3DWaveform || !meshRef.current || !compiledX) return;
+    
+    const t = clock.getElapsedTime();
+    scope.t = t;
+    scope.k = settings.autoEvolve ? mathSettings.k + Math.sin(t * 0.2) * 0.1 : mathSettings.k;
+    scope.w = mathSettings.w;
+    scope.phi = settings.autoEvolve ? mathSettings.phi + t * 0.5 : mathSettings.phi;
+
+    let idx = 0;
+    for (let x = 0; x < count; x++) {
+      for (let z = 0; z < count; z++) {
+        // Map 0-30 to physical space (-20 to 20)
+        const px = (x / count) * 40 - 20;
+        const pz = (z / count) * 40 - 20;
+        
+        scope.z = pz;
+        // Dampen amplitude at edges for a cleaner look
+        scope.A = mathSettings.baseA * Math.exp(-Math.pow(px/10, 2));
+        
+        let py = 0;
+        try {
+          py = compiledX.evaluate(scope);
+        } catch { py = 0; }
+        
+        dummy.position.set(px, py - 40, pz); // Offset down so it doesn't block main fluid
+        dummy.scale.set(0.5, Math.max(0.1, Math.abs(py) * 2), 0.5);
+        dummy.updateMatrix();
+        meshRef.current.setMatrixAt(idx++, dummy.matrix);
+      }
+    }
+    meshRef.current.instanceMatrix.needsUpdate = true;
+  });
+
+  if (!settings.show3DWaveform) return null;
+
+  return (
+    <instancedMesh ref={meshRef} args={[undefined, undefined, count * count]}>
+      <boxGeometry args={[1, 1, 1]} />
+      <meshStandardMaterial color={new THREE.Color(settings.colorSurface)} transparent opacity={0.6} roughness={0.2} metalness={0.8} />
+    </instancedMesh>
+  );
+}
+
+const Scene = ({ viewMode, setViewMode, settings, setSettings, mathSettings, setPunchDataState }: { 
   viewMode: string; 
   setViewMode: (mode: string) => void;
   settings: any;
+  setSettings: any;
   mathSettings: any;
+  setPunchDataState?: (data: any) => void;
 }) => {
   const [punchData, setPunchData] = useState<{ position: THREE.Vector3; time: number } | null>(null)
   const [activeBeams, setActiveBeams] = useState<{ id: string; position: THREE.Vector3 }[]>([])
+  
+  useEffect(() => {
+    if (setPunchDataState) {
+        setPunchDataState(punchData);
+    }
+  }, [punchData, setPunchDataState]);
   const { clock } = useThree()
 
   const handlePunch = useCallback((position: THREE.Vector3, inputSource?: any) => {
@@ -739,6 +1032,9 @@ const Scene = ({ viewMode, setViewMode, settings, mathSettings }: {
         )}
         {(viewMode === 'math' || viewMode === 'hybrid') && <MathGraph punchData={punchData} settings={settings} mathSettings={mathSettings} />}
         
+        <Volumetric3DWaveform settings={settings} mathSettings={mathSettings} />
+        <VRControlPanel settings={settings} setSettings={setSettings} setViewMode={setViewMode} />
+        
         {/* Invisible sphere to catch clicks across the volume */}
         <mesh>
           <sphereGeometry args={[80, 32, 32]} />
@@ -783,18 +1079,31 @@ const Scene = ({ viewMode, setViewMode, settings, mathSettings }: {
 
       {/* Post-processing for Dazzling Visuals - Optimized for VR */}
       <EffectComposer>
+        {settings.enableAdvancedRendering && (
+          <>
+            <SSAO samples={21} radius={0.1} intensity={20} luminanceInfluence={0.1} />
+          </>
+        )}
         <Bloom 
           luminanceThreshold={0.5} 
           luminanceSmoothing={0.9} 
           intensity={1.0} 
           mipmapBlur 
         />
+        {viewMode !== 'fluid' && (
+          <ChromaticAberration
+            blendFunction={BlendFunction.NORMAL} 
+            offset={new THREE.Vector2(0.002, 0.002)} 
+          />
+        )}
+        <Vignette eskil={false} offset={0.1} darkness={1.1} />
+        <Noise opacity={0.03} />
       </EffectComposer>
     </>
   )
 }
 
-import { Settings, Sliders, Volume2, Zap, Palette, X, Calculator, HelpCircle, ChevronRight, ChevronLeft } from 'lucide-react'
+import { Settings, Sliders, Volume2, Zap, Palette, X, Calculator, HelpCircle, ChevronRight, ChevronLeft, Save } from 'lucide-react'
 
 // --- 4.5. Tutorial Component ---
 const TutorialOverlay = ({ isOpen, onClose, viewMode, setViewMode, setIsSettingsOpen }: { 
@@ -963,6 +1272,14 @@ const WebGLFallback = () => (
   </div>
 );
 
+// Helper component specifically for running side-effects based on deps
+const Effect = ({ updater, deps }: { updater: () => void, deps: any[] }) => {
+  useEffect(() => {
+    updater()
+  }, deps)
+  return null
+}
+
 // --- 5. The Main App with UI ---
 export default function App() {
   const [isHovered, setIsHovered] = useState(false)
@@ -972,6 +1289,7 @@ export default function App() {
   const [xrSupported, setXrSupported] = useState<boolean | null>(null)
   const [xrError, setXrError] = useState<string | null>(null)
   const [webGLSupported, setWebGLSupported] = useState<boolean | null>(null)
+  const [punchDataState, setPunchDataState] = useState<any>(null)
 
   useEffect(() => {
     // WebGL Support Check
@@ -1006,8 +1324,32 @@ export default function App() {
     waveSpeed: 12.0,
     intensityFalloff: 0.2,
     soundVolume: 0.5,
-    hapticIntensity: 0.6
+    hapticIntensity: 0.6,
+    autoEvolve: false,
+    show3DWaveform: false,
+    enableAdvancedRendering: false
   })
+
+  // State Management presets
+  const [presets, setPresets] = useState<any[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('cosmic-gel-presets') || '[]')
+    } catch(e) {
+      return []
+    }
+  })
+
+  const savePreset = () => {
+    const newPreset = { id: Date.now(), name: `State ${presets.length + 1}`, settings, mathSettings }
+    const updated = [...presets, newPreset]
+    setPresets(updated)
+    localStorage.setItem('cosmic-gel-presets', JSON.stringify(updated))
+  }
+
+  const loadPreset = (p: any) => {
+    setSettings(p.settings)
+    setMathSettings(p.mathSettings)
+  }
 
   const [mathSettings, setMathSettings] = useState({
     eqX: 'cos(k * z - w * t + phi) * A',
@@ -1043,14 +1385,19 @@ export default function App() {
             setIsSettingsOpen(!isSettingsOpen)
             playSound('ui', settings.soundVolume)
           }}
-          className="p-3 bg-white/10 hover:bg-white/20 text-white rounded-lg transition-all border border-white/10"
+          className="p-3 bg-white/10 hover:bg-white/20 text-white rounded-lg transition-all border border-white/10 group relative"
+          title="Open Settings"
         >
           <Settings size={20} />
+          <span className="absolute top-full mt-2 right-0 bg-black/90 text-[10px] tracking-widest uppercase px-2 py-1 border border-white/10 rounded opacity-0 group-hover:opacity-100 whitespace-nowrap transition-opacity pointer-events-none">
+            Lab Settings
+          </span>
         </button>
         <button 
           onClick={async () => {
             try {
               setXrError(null)
+              initAmbientAudio() // Ensure audio context is started on user gesture
               await store.enterVR()
               playSound('ui', settings.soundVolume)
             } catch (e: any) {
@@ -1085,15 +1432,28 @@ export default function App() {
         setIsSettingsOpen={setIsSettingsOpen}
       />
 
+      {/* Ambient Audio Updater */}
+      <Effect updater={() => {
+         // This runs when viewMode or settings change, but we need to ensure audioCtx is initialized
+         // Usually done on first click in the app to comply with browser autoplay policies
+         updateAmbientAudio(viewMode, settings.waveSpeed, settings.soundVolume)
+      }} deps={[viewMode, settings.waveSpeed, settings.soundVolume]} />
+
       {webGLSupported === false ? (
         <WebGLFallback />
       ) : (
-        <Canvas camera={{ position: [0, 10, 30], fov: 45 }} dpr={[1, 1.5]}>
-          <XR store={store}>
-            <color attach="background" args={['#000000']} />
-            <Scene viewMode={viewMode} setViewMode={setViewMode} settings={settings} mathSettings={mathSettings} />
-          </XR>
-        </Canvas>
+        <>
+          <Canvas camera={{ position: [0, 10, 30], fov: 45 }} dpr={[1, 1.5]}>
+            <XR store={store}>
+              <color attach="background" args={['#000000']} />
+              <Scene viewMode={viewMode} setViewMode={setViewMode} settings={settings} setSettings={setSettings} mathSettings={mathSettings} setPunchDataState={setPunchDataState} />
+            </XR>
+          </Canvas>
+          {/* Invisible overlay for audio init on first click */}
+          {!audioCtx && (
+            <div className="absolute inset-0 z-0 pointer-events-auto" onPointerDown={initAmbientAudio} />
+          )}
+        </>
       )}
 
       {/* Math Editor Panel */}
@@ -1273,6 +1633,43 @@ export default function App() {
                 <label className="text-[10px] uppercase tracking-widest text-white/40 flex items-center gap-2">
                   <Zap size={12} /> Physics
                 </label>
+                
+                {/* Auto Evolve Toggle */}
+                <div className="flex justify-between items-center bg-white/5 p-2 rounded">
+                  <span className="text-[10px] uppercase tracking-widest text-cyan-300">Auto-Evolve Waves</span>
+                  <button 
+                    onClick={() => updateSetting('autoEvolve', !settings.autoEvolve)}
+                    className={`px-3 py-1 text-[10px] uppercase tracking-widest rounded transition-all ${settings.autoEvolve ? 'bg-cyan-500 text-black font-bold' : 'bg-gray-800 text-white'}`}
+                  >
+                    {settings.autoEvolve ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+
+                {/* 3D Waveform Toggle */}
+                <div className="flex justify-between items-center bg-white/5 p-2 rounded">
+                  <span className="text-[10px] uppercase tracking-widest text-cyan-300">3D Volumetric Waveform</span>
+                  <button 
+                    onClick={() => updateSetting('show3DWaveform', !settings.show3DWaveform)}
+                    className={`px-3 py-1 text-[10px] uppercase tracking-widest rounded transition-all ${settings.show3DWaveform ? 'bg-cyan-500 text-black font-bold' : 'bg-gray-800 text-white'}`}
+                  >
+                    {settings.show3DWaveform ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+
+                {/* Advanced Rendering */}
+                <div className="flex justify-between items-center bg-white/5 p-2 rounded relative group">
+                  <span className="text-[10px] uppercase tracking-widest text-cyan-300">Advanced Rendering (SSAO/SSR)</span>
+                  <button 
+                    onClick={() => updateSetting('enableAdvancedRendering', !settings.enableAdvancedRendering)}
+                    className={`px-3 py-1 text-[10px] uppercase tracking-widest rounded transition-all ${settings.enableAdvancedRendering ? 'bg-orange-500 text-black font-bold' : 'bg-gray-800 text-white'}`}
+                  >
+                    {settings.enableAdvancedRendering ? 'ON' : 'OFF'}
+                  </button>
+                  <div className="absolute top-full left-0 mt-1 bg-black/90 text-red-400 text-[10px] p-2 rounded border border-red-500/50 opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-[200]">
+                    Warning: May heavily impact performance in VR.
+                  </div>
+                </div>
+
                 <div className="flex flex-col gap-2">
                   <div className="flex justify-between text-[10px] uppercase">
                     <span>Wave Speed</span>
@@ -1328,6 +1725,43 @@ export default function App() {
                     className="accent-cyan-500"
                   />
                 </div>
+              </div>
+
+              {/* State Management */}
+              <div className="flex flex-col gap-4 border-t border-cyan-500/30 pt-4">
+                <label className="text-[10px] uppercase tracking-widest text-white/40 flex items-center gap-2">
+                  <Save size={12} /> Presets & States
+                </label>
+                <button 
+                  onClick={savePreset}
+                  className="w-full py-2 bg-cyan-600/30 hover:bg-cyan-600 text-white text-[10px] tracking-widest uppercase font-bold rounded transition-all"
+                >
+                  Save Current Configuration
+                </button>
+                
+                {presets.length > 0 && (
+                  <div className="flex flex-col gap-2 max-h-32 overflow-y-auto pr-1">
+                    {presets.map((p, i) => (
+                      <div key={p.id} className="flex justify-between items-center text-[10px] bg-white/5 border border-white/10 p-2 rounded hover:border-cyan-500/50 transition-colors">
+                        <span className="truncate max-w-[120px]">{p.name || `State ${i + 1}`}</span>
+                        <div className="flex gap-2">
+                           <button 
+                             onClick={() => loadPreset(p)} 
+                             className="text-cyan-400 hover:text-cyan-300 px-2 py-1 bg-cyan-900/40 rounded uppercase tracking-widest transition-colors font-bold"
+                           >
+                             Load
+                           </button>
+                           <button 
+                             onClick={() => setPresets(presets.filter(pr => pr.id !== p.id))} 
+                             className="text-red-400 hover:text-red-300 px-2 py-1 bg-red-900/40 rounded uppercase tracking-widest transition-colors"
+                           >
+                             Del
+                           </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1393,12 +1827,14 @@ export default function App() {
           {viewMode === 'hybrid' && 'Vortex Engine'}
         </h1>
         <div className="h-px w-16 bg-cyan-500 mb-4" />
-        <p className="text-xs opacity-60 leading-relaxed text-cyan-100">
+        <p className="text-xs opacity-60 leading-relaxed text-cyan-100 mb-4">
           {viewMode === 'fluid' && 'A continuous, viscoelastic fluid simulation. Click to create a transverse shear vortex.'}
           {viewMode === 'math' && 'Mathematical representation of the helical wave. Light is a screw-thread, not a flat zigzag.'}
           {viewMode === 'hybrid' && 'Observe the mathematical structure threading through the physical fluid medium.'}
         </p>
       </div>
+
+      <WaveformAnalyzer mathSettings={mathSettings} punchData={punchDataState} />
 
       <div className="absolute bottom-10 right-10 text-right text-[10px] tracking-widest uppercase pointer-events-none text-cyan-500 opacity-50">
         React Three Fiber / Volumetric Shaders
